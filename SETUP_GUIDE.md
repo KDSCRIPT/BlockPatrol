@@ -1,4 +1,4 @@
-# PDF Processing Pipeline with IPFS, GCP, and Streamlit
+# PDF Processing Pipeline with GCP and Streamlit
 
 This guide provides detailed instructions on how to set up and run the PDF Processing Pipeline application, which allows uploading PDF files, storing them on IPFS, extracting data, and analyzing them using Google Cloud services and Gemini AI.
 
@@ -32,73 +32,103 @@ pip install -r requirements.txt
 python -c "import nltk; nltk.download('punkt')"
 ```
 
-### 2. Set Up IPFS
+### 2. Set Up Google Cloud Platform
 
-The application requires an IPFS node for decentralized storage of PDF files. You can set it up using the provided script:
+The application uses Google Cloud Storage for storing text chunks and BigQuery for efficient search. You need to set up these services in your GCP project.
 
-#### Automated Setup:
+#### Automated Setup (Using Google Cloud Shell):
 
-```bash
-# Make the script executable
-chmod +x setup_ipfs.sh
+The `setup_gcp.sh` script can be run in the Google Cloud Shell to automate the setup process:
 
-# Run the setup script
-./setup_ipfs.sh
-```
-
-#### Manual Setup:
-
-1. Download and install IPFS from [https://docs.ipfs.tech/install/command-line/](https://docs.ipfs.tech/install/command-line/)
-2. Initialize IPFS: `ipfs init`
-3. Configure CORS settings:
-   ```bash
-   ipfs config --json API.HTTPHeaders.Access-Control-Allow-Origin '["*"]'
-   ipfs config --json API.HTTPHeaders.Access-Control-Allow-Methods '["PUT", "POST", "GET"]'
-   ```
-4. Start the IPFS daemon: `ipfs daemon`
-
-### 3. Set Up Google Cloud Platform
-
-The application uses Google Cloud Storage for storing text chunks and BigQuery for efficient search.
-
-#### Automated Setup:
+1. Open [Google Cloud Console](https://console.cloud.google.com/)
+2. Click on the Cloud Shell icon (>_) in the top right corner
+3. Upload the `setup_gcp.sh` script to Cloud Shell
+4. Make it executable and run it:
 
 ```bash
 # Make the script executable
 chmod +x setup_gcp.sh
 
 # Review and edit the script variables at the top before running
-# Specifically, set your PROJECT_ID and BILLING_ACCOUNT
+# Specifically, set your PROJECT_ID and BILLING_ACCOUNT and REGION
 
 # Run the setup script
 ./setup_gcp.sh
 ```
 
-#### Manual Setup:
+#### Manual Setup (Step by Step):
 
-1. Create a new Google Cloud Project
-2. Enable the following APIs:
-   - Cloud Storage API
-   - BigQuery API
-   - BigQuery Storage API
-   - Cloud Resource Manager API
-   - IAM API
-   - AI Platform API (for Vertex AI embeddings)
-3. Create a GCS bucket for storing chunks
-4. Create a BigQuery dataset and table with the following schema:
-   ```
-   chunk_id: STRING (REQUIRED)
-   doc_id: STRING (REQUIRED)
-   filename: STRING (REQUIRED)
-   gcs_path: STRING (REQUIRED)
-   original_pdf_ipfs_path: STRING (REQUIRED)
-   text: STRING (REQUIRED)
-   embedding: ARRAY<FLOAT> (NULLABLE)
-   pdf_metadata: STRING (NULLABLE)
-   ```
-5. Create a service account with appropriate permissions and download the credentials JSON file
+Follow these steps in the Google Cloud Console (https://console.cloud.google.com/):
 
-### 4. Environment Configuration
+1. **Create a new Google Cloud Project**:
+   - Go to the [Manage Resources page](https://console.cloud.google.com/cloud-resource-manager)
+   - Click "CREATE PROJECT"
+   - Enter a project name and select a billing account
+   - Click "CREATE"
+
+2. **Enable Required APIs**:
+   - Navigate to [API Library](https://console.cloud.google.com/apis/library)
+   - Search for and enable each of these APIs:
+     - Cloud Storage API
+     - BigQuery API
+     - BigQuery Storage API
+     - Cloud Resource Manager API
+     - IAM API
+     - AI Platform API (for Vertex AI embeddings)
+
+3. **Create a Cloud Storage bucket**:
+   - Go to [Cloud Storage browser](https://console.cloud.google.com/storage/browser)
+   - Click "CREATE BUCKET"
+   - Name your bucket (must be globally unique)
+   - Choose Region (e.g., us-central1)
+   - Leave other settings as default
+   - Click "CREATE"
+
+4. **Create a BigQuery dataset**:
+   - Go to [BigQuery Console](https://console.cloud.google.com/bigquery)
+   - In your project, click "CREATE DATASET"
+   - Enter Dataset ID (e.g., pdf_processing)
+   - Choose location (match your GCS bucket region for best performance)
+   - Click "CREATE DATASET"
+
+5. **Create a BigQuery table**:
+   - In your new dataset, click "CREATE TABLE"
+   - Source: Empty table
+   - Destination: 
+     - Table name: pdf_chunks
+     - Schema: Click "EDIT AS TEXT" and paste this schema:
+     ```
+     chunk_id:STRING,doc_id:STRING,filename:STRING,gcs_path:STRING,original_pdf_ipfs_path:STRING,text:STRING,embedding:FLOAT64[],pdf_metadata:STRING
+     ```
+   - Click "CREATE TABLE"
+
+6. **Create a Service Account**:
+   - Go to [IAM & Admin > Service Accounts](https://console.cloud.google.com/iam-admin/serviceaccounts)
+   - Click "CREATE SERVICE ACCOUNT"
+   - Name: pdf-processor
+   - Grant required roles:
+     - Storage Admin
+     - BigQuery Admin
+     - Service Account User
+   - Click "DONE"
+
+7. **Create and download a key**:
+   - Find your service account in the list
+   - Click the three dots menu > "Manage keys"
+   - Click "ADD KEY" > "Create new key"
+   - Choose JSON format
+   - Click "CREATE" (This downloads a JSON key file)
+   - Store this file securely - you'll need it for your application
+
+8. **Create a search index for your BigQuery table** (Optional - for better search performance):
+   - Go to the BigQuery console
+   - Navigate to your table
+   - Click "CREATE SEARCH INDEX"
+   - Name your index (e.g., pdf_chunks_text_index)
+   - Select the "text" column
+   - Click "CREATE"
+
+### 3. Environment Configuration
 
 Create a `.env` file in the root directory based on the `env.example` file:
 
@@ -140,7 +170,7 @@ ADMIN_EMAIL=admin@example.com
 APTOS_NODE_URL=https://fullnode.testnet.aptoslabs.com/v1
 ```
 
-### 5. Running the Application
+### 4. Running the Application
 
 You have two options for running the application:
 
@@ -210,18 +240,13 @@ API endpoints from the FastAPI backend (available at http://localhost:8000):
 
 ## Troubleshooting
 
-### IPFS Connection Issues
-
-- Ensure the IPFS daemon is running: `ipfs daemon`
-- Verify IPFS API is accessible: `curl http://localhost:5001/api/v0/version`
-- Check CORS settings: `ipfs config show` and verify Access-Control-Allow headers
-
 ### Google Cloud Issues
 
 - Verify your service account key is correct and has the necessary permissions
 - Ensure the `GOOGLE_APPLICATION_CREDENTIALS` environment variable points to your service account key file
 - Check that all required APIs are enabled in your Google Cloud project
 - Verify bucket and dataset/table exist and have the correct schemas
+- Ensure you have sufficient permissions and quota in your GCP project
 
 ### Streamlit Connection Issues
 
