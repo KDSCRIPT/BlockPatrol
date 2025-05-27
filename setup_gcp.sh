@@ -1,28 +1,25 @@
 #!/bin/bash
 # Google Cloud Project Setup Script for PDF Processing Pipeline
 # This script sets up a complete Google Cloud environment for the PDF processing application
+# Now with automatic project detection and forced service account key generation!
 
 # Exit on error
 set -e
 
 # --- BEGIN USER CONFIGURATION ---
-# PLEASE REVIEW AND UPDATE THESE VARIABLES BEFORE RUNNING THE SCRIPT:
+# The script will try to auto-detect these values, but you can override them here:
 
-# 1. PROJECT_ID: Choose a globally unique ID for your new project.
-#    If the default ID below is already taken, the script will fail.
-#    You can change it here or the script will guide you if creation fails.
-PROJECT_ID="qwiklabs-gcp-02-064a3eec3a9c"  # Appends a random number to increase uniqueness
+# 1. PROJECT_ID: Leave empty to auto-detect or set a specific project ID
+PROJECT_ID=""  # Will auto-detect if empty
 
-# 2. PROJECT_NAME: A user-friendly name for your project.
+# 2. PROJECT_NAME: A user-friendly name for your project (only used for new projects)
 PROJECT_NAME="PDF Processing Pipeline"
 
-# 3. BILLING_ACCOUNT: Your Google Cloud Billing Account ID.
-#    This is REQUIRED. The script will prompt you if it's not set.
-#    Find your Billing Account ID by running: gcloud billing accounts list
-BILLING_ACCOUNT="014F8D-C0020C-E4D2D3"
-
-# 4. REGION: The default region for your resources.
+# 3. REGION: The default region for your resources
 REGION="us-west1"
+
+# 4. CREATE_NEW_PROJECT: Set to true to force creation of a new project
+CREATE_NEW_PROJECT=false
 
 # --- END USER CONFIGURATION ---
 
@@ -30,8 +27,10 @@ REGION="us-west1"
 ZONE="${REGION}-a"
 BQ_DATASET="pdf_processing"
 BQ_TABLE="pdf_chunks"
-GCS_BUCKET="${PROJECT_ID}-chunks"
 SERVICE_ACCOUNT_NAME="pdf-processor"
+# The key file will always be named this way and placed in the current directory
+SERVICE_ACCOUNT_KEY_FILENAME="credentials.json"
+SERVICE_ACCOUNT_KEY_FILE="" # Will be set to full path later
 
 # Colors for output
 RED='\033[0;31m'
@@ -57,9 +56,182 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# Function to get user input with default
+get_input() {
+    local prompt="$1"
+    local default="$2"
+    local result
+    
+    if [ -n "$default" ]; then
+        read -p "$prompt [$default]: " result
+        echo "${result:-$default}"
+    else
+        read -p "$prompt: " result
+        echo "$result"
+    fi
+}
+
+# Function to auto-detect or select project
+detect_project() {
+    print_info "Detecting available Google Cloud projects..."
+    
+    # Get current project if set
+    local current_project
+    current_project=$(gcloud config get project 2>/dev/null || echo "")
+    
+    # Get all accessible projects
+    local projects
+    projects=$(gcloud projects list --format="value(projectId,name)" 2>/dev/null || echo "")
+    
+    if [ -z "$projects" ]; then
+        print_warning "No existing projects found or insufficient permissions."
+        CREATE_NEW_PROJECT=true
+        return
+    fi # Added missing 'fi' here
+    
+    print_info "Available projects:"
+    echo "$projects" | nl -w2 -s'. '
+    
+    if [ -n "$current_project" ]; then
+        print_info "Currently active project: $current_project"
+        
+        echo ""
+        local choice
+        choice=$(get_input "Use current project '$current_project'? (y/N/list number)" "N")
+        
+        case $choice in
+            [Yy]|[Yy][Ee][Ss])
+                PROJECT_ID="$current_project"
+                print_success "Using current project: $PROJECT_ID"
+                return
+                ;;
+            [0-9]*)
+                PROJECT_ID=$(echo "$projects" | sed -n "${choice}p" | cut -f1)
+                if [ -n "$PROJECT_ID" ]; then
+                    print_success "Selected project: $PROJECT_ID"
+                    return
+                else
+                    print_error "Invalid selection."
+                fi
+                ;;
+        esac
+    fi
+    
+    echo ""
+    local choice
+    choice=$(get_input "Select a project by number, or press Enter to create new" "")
+    
+    if [ -n "$choice" ] && [[ "$choice" =~ ^[0-9]+$ ]]; then
+        PROJECT_ID=$(echo "$projects" | sed -n "${choice}p" | cut -f1)
+        if [ -n "$PROJECT_ID" ]; then
+            print_success "Selected project: $PROJECT_ID"
+            return
+        else
+            print_error "Invalid selection."
+        fi
+    fi
+    
+    CREATE_NEW_PROJECT=true
+}
+
+# Function to generate unique project ID
+generate_project_id() {
+    local base_id="pdf-processing-$(date +%s)"
+    local random_suffix=$(openssl rand -hex 3 2>/dev/null || echo $(($RANDOM % 1000)))
+    echo "${base_id}-${random_suffix}"
+}
+
+# Function to set up credential file download
+setup_credential_download() {
+    if [ -z "$SERVICE_ACCOUNT_KEY_FILE" ] || [ ! -f "$SERVICE_ACCOUNT_KEY_FILE" ]; then
+        print_warning "No service account key file to set up for download. Skipping download script creation."
+        return
+    fi
+    
+    print_info "Setting up credential file download..."
+    
+    # Create a simple download script
+    cat > "download_credentials.sh" << 'EOL'
+#!/bin/bash
+# Simple HTTP server to download credential file
+PORT=8080
+FILE="$1"
+
+if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
+    echo "Error: Credential file not found or path not provided: $FILE"
+    exit 1
+fi
+
+echo "Starting HTTP server on port $PORT..."
+echo "Download URL: http://localhost:$PORT/credentials.json"
+echo "Press Ctrl+C to stop the server"
+echo ""
+
+# Start simple HTTP server using Python
+if command -v python3 &> /dev/null; then
+    python3 -m http.server $PORT --bind 127.0.0.1 &
+    SERVER_PID=$!
+elif command -v python &> /dev/null; then
+    python -m SimpleHTTPServer $PORT &
+    SERVER_PID=$!
+else
+    echo "Python not found. Cannot start HTTP server."
+    echo "You can manually copy the credential file:"
+    echo "cat $FILE"
+    exit 1
+fi
+
+# Create a symlink for easy download
+# Use absolute path for symlink target for robustness
+TARGET_PATH=$(readlink -f "$FILE")
+ln -sf "$TARGET_PATH" "credentials.json"
+
+# Wait a moment for server to start
+sleep 2
+
+# Try to open browser if available
+if command -v curl &> /dev/null; then
+    echo "Testing server..."
+    if curl -s "http://localhost:$PORT/credentials.json" > /dev/null; then
+        echo "✅ Server is running successfully!"
+    else
+        echo "❌ Server may not be running properly"
+    fi
+fi
+
+echo ""
+echo "=== DOWNLOAD INSTRUCTIONS ==="
+echo "1. Open a new Cloud Shell tab"
+echo "2. Run: curl -O http://localhost:$PORT/credentials.json"
+echo "3. The file will be saved as 'credentials.json'"
+echo "============================"
+echo ""
+
+# Keep server running until user stops it
+wait $SERVER_PID
+EOL
+
+    chmod +x download_credentials.sh
+    
+    print_success "Download setup completed!"
+    print_info "To download your credentials:"
+    echo ""
+    echo -e "${YELLOW}Option 1 - HTTP Server (Recommended for Cloud Shell):${NC}"
+    echo "    ./download_credentials.sh \"$SERVICE_ACCOUNT_KEY_FILE\""
+    echo "    Then open Web Preview on port 8080"
+    echo ""
+    echo -e "${YELLOW}Option 2 - Direct Download (if server is running):${NC}"
+    echo "    curl -L 'http://localhost:8080/credentials.json' -o 'credentials.json'"
+    echo ""
+    echo -e "${YELLOW}Option 3 - Manual Copy:${NC}"
+    echo "    cat \"$SERVICE_ACCOUNT_KEY_FILE\""
+    echo ""
+}
+
 # --- SCRIPT EXECUTION STARTS HERE ---
 
-print_info "Starting Google Cloud Project Setup..."
+print_info "Starting Automated Google Cloud Project Setup..."
+echo ""
 
 # Check if gcloud is installed
 if ! command -v gcloud &> /dev/null; then
@@ -74,47 +246,74 @@ if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep -q
 fi
 print_success "gcloud CLI is installed and user is logged in."
 
-# Validate Billing Account ID
-if [ -z "$BILLING_ACCOUNT" ]; then
-    print_error "BILLING_ACCOUNT variable is not set in the script."
-    print_info "Please edit the script and set the BILLING_ACCOUNT variable."
-    print_info "You can list your available billing accounts using: gcloud billing accounts list"
-    exit 1
+# Auto-detect or get project ID
+if [ -z "$PROJECT_ID" ] && [ "$CREATE_NEW_PROJECT" != true ]; then
+    detect_project
 fi
-print_info "Using Billing Account ID: $BILLING_ACCOUNT"
 
-# Create new project
-print_info "Attempting to create new Google Cloud project: ${PROJECT_NAME} (ID: ${PROJECT_ID})..."
-if gcloud projects describe ${PROJECT_ID} &>/dev/null; then
-    print_warning "Project ${PROJECT_ID} already exists. Skipping creation."
-else
-    if gcloud projects create ${PROJECT_ID} --name="${PROJECT_NAME}"; then
-        print_success "Project ${PROJECT_ID} created successfully."
-    else
-        print_error "Failed to create project ${PROJECT_ID}. It might be taken or there could be other issues."
-        print_info "Please try a different PROJECT_ID in the script or create the project manually via the Google Cloud Console."
+# Handle new project creation
+if [ "$CREATE_NEW_PROJECT" = true ] || [ -z "$PROJECT_ID" ]; then
+    print_info "Creating a new project..."
+    
+    if [ -z "$PROJECT_ID" ]; then
+        PROJECT_ID=$(generate_project_id)
+        print_info "Generated project ID: $PROJECT_ID"
+        
+        local custom_id
+        custom_id=$(get_input "Use this project ID or enter a custom one" "$PROJECT_ID")
+        PROJECT_ID="$custom_id"
+    fi
+    
+    # Validate project ID format
+    if [[ ! "$PROJECT_ID" =~ ^[a-z][a-z0-9-]{5,29}$ ]]; then
+        print_error "Invalid project ID format. Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens, and be 6-30 characters long."
         exit 1
+    fi
+fi
+
+print_info "Final configuration:"
+echo -e "    Project ID: ${GREEN}$PROJECT_ID${NC}"
+echo -e "    Region: ${GREEN}$REGION${NC}" # Removed billing account from printout
+echo ""
+
+# Confirm before proceeding
+if [ "$CREATE_NEW_PROJECT" = true ]; then
+    read -p "Create new project with this configuration? (y/N): " confirm
+else
+    read -p "Proceed with this configuration? (y/N): " confirm
+fi
+
+case $confirm in
+    [Yy]|[Yy][Ee][Ss]) ;;
+    *)    
+        print_info "Setup cancelled by user."
+        exit 0
+        ;;
+esac
+
+# Set derived variables now that we have PROJECT_ID
+GCS_BUCKET="${PROJECT_ID}-chunks"
+SERVICE_ACCOUNT_EMAIL="${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+SERVICE_ACCOUNT_KEY_FILE="${PWD}/${SERVICE_ACCOUNT_KEY_FILENAME}" # Always define full path for the key file
+
+# Create new project if needed
+if [ "$CREATE_NEW_PROJECT" = true ]; then
+    print_info "Creating new Google Cloud project: ${PROJECT_NAME} (ID: ${PROJECT_ID})..."
+    if gcloud projects describe ${PROJECT_ID} &>/dev/null; then
+        print_warning "Project ${PROJECT_ID} already exists. Using existing project."
+    else
+        if gcloud projects create ${PROJECT_ID} --name="${PROJECT_NAME}"; then
+            print_success "Project ${PROJECT_ID} created successfully."
+        else
+            print_error "Failed to create project ${PROJECT_ID}."
+            exit 1
+        fi
     fi
 fi
 
 # Set as default project
 print_info "Setting ${PROJECT_ID} as the default project for gcloud commands..."
 gcloud config set project ${PROJECT_ID}
-
-# Link billing account to project
-print_info "Linking Billing Account ${BILLING_ACCOUNT} to project ${PROJECT_ID}..."
-if gcloud billing projects describe ${PROJECT_ID} | grep -q "billingAccountName: billingAccounts/${BILLING_ACCOUNT}"; then
-    print_warning "Project ${PROJECT_ID} is already linked to Billing Account ${BILLING_ACCOUNT}."
-else
-    if gcloud billing projects link ${PROJECT_ID} --billing-account=${BILLING_ACCOUNT}; then
-        print_success "Billing Account linked successfully to project ${PROJECT_ID}."
-    else
-        print_error "Failed to link Billing Account ${BILLING_ACCOUNT} to project ${PROJECT_ID}."
-        print_info "Please ensure the billing account ID is correct and you have permissions to link it."
-        print_info "You can try linking it manually in the Google Cloud Console."
-        exit 1
-    fi
-fi
 
 # Enable required APIs
 APIS_TO_ENABLE=(
@@ -163,228 +362,340 @@ if bq --project_id=${PROJECT_ID} ls --datasets | grep -qw ${BQ_DATASET}; then
 else
     if bq --location=${REGION} --project_id=${PROJECT_ID} mk --dataset --description "Dataset for PDF processing and RAG" ${PROJECT_ID}:${BQ_DATASET}; then
         print_success "BigQuery dataset ${BQ_DATASET} created successfully."
-    else 
+    else    
         print_error "Failed to create BigQuery dataset ${BQ_DATASET}."
         exit 1
     fi
 fi
 
-# Create BigQuery table schema file (temporary)
-BQ_SCHEMA_FILE="bq_schema_temp.json"
-print_info "Defining BigQuery table schema in ${BQ_SCHEMA_FILE}..."
-cat > ${BQ_SCHEMA_FILE} << EOL
-[
-  {"name": "chunk_id", "type": "STRING", "mode": "REQUIRED", "description": "Unique identifier for the chunk"},
-  {"name": "doc_id", "type": "STRING", "mode": "REQUIRED", "description": "Document ID the chunk belongs to"},
-  {"name": "filename", "type": "STRING", "mode": "REQUIRED", "description": "Original PDF filename"},
-  {"name": "gcs_path", "type": "STRING", "mode": "REQUIRED", "description": "GCS path to the chunk data"},
-  {"name": "original_pdf_ipfs_path", "type": "STRING", "mode": "REQUIRED", "description": "IPFS path to the original PDF"},
-  {"name": "text", "type": "STRING", "mode": "REQUIRED", "description": "Text content of the chunk for search"},
-  {"name": "embedding", "type": "ARRAY<FLOAT>", "mode": "NULLABLE", "description": "Vector embedding for semantic search"},
-  {"name": "pdf_metadata", "type": "STRING", "mode": "NULLABLE", "description": "JSON-encoded PDF metadata"}
-]
-EOL
-
 # Create BigQuery table
 print_info "Creating BigQuery table: ${PROJECT_ID}:${BQ_DATASET}.${BQ_TABLE}..."
-if bq --project_id=${PROJECT_ID} show ${PROJECT_ID}:${BQ_DATASET}.${BQ_TABLE} &>/dev/null; then
-    print_warning "BigQuery table ${BQ_TABLE} already exists in dataset ${BQ_DATASET}. Skipping creation."
+# Use a direct SQL CREATE TABLE statement for more robust type handling
+SQL_CREATE_TABLE="CREATE TABLE IF NOT EXISTS \`${PROJECT_ID}.${BQ_DATASET}.${BQ_TABLE}\` (
+  chunk_id STRING NOT NULL,
+  doc_id STRING NOT NULL,
+  filename STRING NOT NULL,
+  gcs_path STRING NOT NULL,
+  original_pdf_ipfs_path STRING NOT NULL,
+  text STRING NOT NULL,
+  embedding ARRAY<FLOAT64>,
+  pdf_metadata STRING
+)"
+
+if bq --project_id=${PROJECT_ID} query --nouse_legacy_sql "${SQL_CREATE_TABLE}"; then
+    print_success "BigQuery table ${BQ_TABLE} created successfully."
 else
-    if bq mk --table --project_id=${PROJECT_ID} --description "PDF chunks for processing and search" --schema ${BQ_SCHEMA_FILE} ${PROJECT_ID}:${BQ_DATASET}.${BQ_TABLE}; then
-        print_success "BigQuery table ${BQ_TABLE} created successfully."
-    else
-        print_error "Failed to create BigQuery table ${BQ_TABLE}."
-        rm -f ${BQ_SCHEMA_FILE}
-        exit 1
-    fi
+    print_error "Failed to create BigQuery table ${BQ_TABLE}."
+    exit 1
 fi
-rm -f ${BQ_SCHEMA_FILE} # Clean up temporary schema file
 
 # Create a search index on the text field
 SEARCH_INDEX_NAME="${BQ_TABLE}_text_index"
-print_info "Checking for existing search index ${SEARCH_INDEX_NAME}..."
-# Note: Checking for existing search indexes via bq command is not straightforward.
-# We will attempt to create it; if it exists, the command might fail gracefully or do nothing.
-print_info "Attempting to create search index ${SEARCH_INDEX_NAME} on the text field (this may take a few minutes)..."
+print_info "Creating search index ${SEARCH_INDEX_NAME} on the text field..."
 SQL_CREATE_INDEX="CREATE SEARCH INDEX IF NOT EXISTS ${SEARCH_INDEX_NAME} ON \`${PROJECT_ID}.${BQ_DATASET}.${BQ_TABLE}\`(text)"
 if bq query --project_id=${PROJECT_ID} --nouse_legacy_sql "${SQL_CREATE_INDEX}"; then
-    print_success "Search index ${SEARCH_INDEX_NAME} creation command executed successfully (or index already exists)."
+    print_success "Search index ${SEARCH_INDEX_NAME} created successfully."
 else
-    print_warning "Failed to execute search index creation for ${SEARCH_INDEX_NAME}. It might already exist or there could be an issue. Manual check might be needed."
+    print_warning "Failed to create search index ${SEARCH_INDEX_NAME}. This feature might not be available in your region."
 fi
 
 # Create a vector search index for semantic search
 VECTOR_INDEX_NAME="${BQ_TABLE}_vector_index"
 print_info "Creating vector search index ${VECTOR_INDEX_NAME} for semantic search..."
-print_info "Checking if vector search is supported in your BigQuery region..."
 
-# Try different approaches for vector search setup
-# Option 1: Attempt with standard syntax
-SQL_CREATE_VECTOR_INDEX="CREATE OR REPLACE VECTOR INDEX ${VECTOR_INDEX_NAME} ON \`${PROJECT_ID}.${BQ_DATASET}.${BQ_TABLE}\`(embedding) OPTIONS(distance_type='COSINE')"
+# Single attempt: Explicitly define IVF with correct ivf_options using num_lists
+SQL_CREATE_VECTOR_INDEX="CREATE OR REPLACE VECTOR INDEX ${VECTOR_INDEX_NAME} ON \`${PROJECT_ID}.${BQ_DATASET}.${BQ_TABLE}\`(embedding) OPTIONS(distance_type='COSINE', index_type='IVF', ivf_options='{\"num_lists\": 100}')"
 if bq query --project_id=${PROJECT_ID} --nouse_legacy_sql "${SQL_CREATE_VECTOR_INDEX}" 2>/dev/null; then
-    print_success "Vector index ${VECTOR_INDEX_NAME} creation command executed successfully."
+    print_success "Vector index ${VECTOR_INDEX_NAME} created successfully (explicit IVF)."
 else
-    print_warning "Standard vector index creation failed. Trying alternative approach..."
-    
-    # Option 2: Try without specifying dimensions (let BigQuery infer it)
-    SQL_CREATE_VECTOR_INDEX_ALT="CREATE OR REPLACE VECTOR INDEX ${VECTOR_INDEX_NAME} ON \`${PROJECT_ID}.${BQ_DATASET}.${BQ_TABLE}\`(embedding)"
-    if bq query --project_id=${PROJECT_ID} --nouse_legacy_sql "${SQL_CREATE_VECTOR_INDEX_ALT}" 2>/dev/null; then
-        print_success "Vector index ${VECTOR_INDEX_NAME} created with alternative syntax."
-    else
-        print_warning "Vector index creation failed. This might be because:"
-        print_warning "  1. Vector search may not be available in your current BigQuery region"
-        print_warning "  2. Your account may not have sufficient permissions"
-        print_warning "  3. Vector search is in preview and syntax may have changed"
-        print_info "\nTo use semantic search without vector indexes, you can:"
-        print_info "  1. Use the built-in text search functionality which is still powerful"
-        print_info "  2. Store embeddings in your BigQuery table and perform cosine similarity in queries"
-        print_info "  3. Try creating the vector index manually later with:"
-        print_info "     ${SQL_CREATE_VECTOR_INDEX_ALT}"
-        print_info "\nThis won't block the rest of your setup - the application can fall back to keyword search."
-    fi
+    # Changed error message to be more informative about the data requirement
+    print_warning "Vector index creation failed. This is likely because the 'embedding' column is empty. The index will be created automatically once data with embeddings is loaded into the table."
+    print_info "The application will fall back to keyword search, which is still powerful, until the vector index is populated."
 fi
 
-# Create service account
-SERVICE_ACCOUNT_NAME="pdf-processor"
-SERVICE_ACCOUNT_EMAIL="${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
-print_info "Creating service account: ${SERVICE_ACCOUNT_NAME} (${SERVICE_ACCOUNT_EMAIL})..."
+# --- Service Account and Key Management ---
+print_info "Setting up service account and generating key file..."
+
+# Create service account if it doesn't exist
 if gcloud iam service-accounts describe ${SERVICE_ACCOUNT_EMAIL} --project=${PROJECT_ID} &>/dev/null; then
-    print_warning "Service account ${SERVICE_ACCOUNT_EMAIL} already exists. Skipping creation."
+    print_warning "Service account ${SERVICE_ACCOUNT_EMAIL} already exists."
 else
-    if gcloud iam service-accounts create ${SERVICE_ACCOUNT_NAME} --project=${PROJECT_ID} --display-name="PDF Processing Service Account"; then 
+    if gcloud iam service-accounts create ${SERVICE_ACCOUNT_NAME} --project=${PROJECT_ID} --display-name="PDF Processing Service Account"; then    
         print_success "Service account ${SERVICE_ACCOUNT_EMAIL} created successfully."
     else
-        print_warning "Failed to create service account ${SERVICE_ACCOUNT_NAME}. Using default Qwiklabs account instead."
-        SERVICE_ACCOUNT_EMAIL="$(gcloud config get account)"
-        print_info "Using default Qwiklabs service account: ${SERVICE_ACCOUNT_EMAIL}"
+        print_error "Failed to create service account ${SERVICE_ACCOUNT_EMAIL}. Please check permissions."
+        exit 1
     fi
 fi
 
-# Grant roles to service account
-print_info "Granting necessary permissions..."
+# Delete existing keys and create a new one to ensure a fresh credentials.json
+print_info "Deleting existing service account keys and creating a new one for ${SERVICE_ACCOUNT_EMAIL}..."
+# List keys, filter for user-managed keys (starts with 5), not Google-managed keys
+EXISTING_KEYS=$(gcloud iam service-accounts keys list --iam-account=${SERVICE_ACCOUNT_EMAIL} --project=${PROJECT_ID} --managed-by=user --format="value(name)" 2>/dev/null)
 
-# GCS Storage Admin for bucket access
-print_info "Granting roles/storage.admin on bucket gs://${GCS_BUCKET}..."
-if [[ $SERVICE_ACCOUNT_EMAIL == *"@"* ]]; then
-    if [[ $SERVICE_ACCOUNT_EMAIL == *"iam.gserviceaccount.com" ]]; then
-        # It's a service account
-        gcloud storage buckets add-iam-policy-binding gs://${GCS_BUCKET} --project=${PROJECT_ID} \
-            --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
-            --role="roles/storage.admin" --condition=None >/dev/null # Suppress verbose output
-    else
-        # It's a user account
-        gcloud storage buckets add-iam-policy-binding gs://${GCS_BUCKET} --project=${PROJECT_ID} \
-            --member="user:${SERVICE_ACCOUNT_EMAIL}" \
-            --role="roles/storage.admin" --condition=None >/dev/null # Suppress verbose output
-    fi
-    print_success "Role roles/storage.admin granted on GCS bucket."
+if [ -n "$EXISTING_KEYS" ]; then
+    for KEY_ID in $EXISTING_KEYS; do
+        print_info "Deleting key: ${KEY_ID}"
+        gcloud iam service-accounts keys delete ${KEY_ID} --iam-account=${SERVICE_ACCOUNT_EMAIL} --project=${PROJECT_ID} -q
+    done
+    print_success "All user-managed keys for ${SERVICE_ACCOUNT_EMAIL} deleted."
 else
-    print_warning "Invalid service account email. Skipping permission assignment."
+    print_info "No user-managed keys found for ${SERVICE_ACCOUNT_EMAIL}."
 fi
 
-# Try to grant BigQuery permissions if possible
-print_info "Attempting to grant BigQuery permissions..."
-if [[ $SERVICE_ACCOUNT_EMAIL == *"iam.gserviceaccount.com" ]]; then
-    # Only try this for service accounts, not user accounts
-    if gcloud projects add-iam-policy-binding ${PROJECT_ID} \
-        --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
-        --role="roles/bigquery.dataEditor" --condition=None >/dev/null 2>&1; then
-        print_success "Role roles/bigquery.dataEditor granted on project."
-        
-        gcloud projects add-iam-policy-binding ${PROJECT_ID} \
-            --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
-            --role="roles/bigquery.jobUser" --condition=None >/dev/null 2>&1
-        print_success "Role roles/bigquery.jobUser granted on project."
-        
-        # Grant Vertex AI access for embedding generation
-        print_info "Attempting to grant Vertex AI permissions..."
-        if gcloud projects add-iam-policy-binding ${PROJECT_ID} \
-            --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
-            --role="roles/aiplatform.user" --condition=None >/dev/null 2>&1; then
-            print_success "Role roles/aiplatform.user granted on project for embedding generation."
-        else
-            print_warning "Could not grant Vertex AI permissions. This might be expected in Qwiklabs environment."
-        fi
-    else
-        print_warning "Could not grant BigQuery permissions. This is expected in Qwiklabs environment."
-    fi
-fi
-
-print_info "Note: In Qwiklabs environment, you already have necessary BigQuery permissions through your student account."
-print_success "All available permissions assigned."
-
-# Create service account key if it's a service account
-SERVICE_ACCOUNT_KEY_FILE="${PROJECT_ID}-${SERVICE_ACCOUNT_NAME}-key.json"
-if [[ $SERVICE_ACCOUNT_EMAIL == *"iam.gserviceaccount.com" ]]; then
-    print_info "Creating service account key file: ${SERVICE_ACCOUNT_KEY_FILE}..."
-    if gcloud iam service-accounts keys create ${SERVICE_ACCOUNT_KEY_FILE} --project=${PROJECT_ID} --iam-account=${SERVICE_ACCOUNT_EMAIL}; then
-        print_success "Service account key created: ${SERVICE_ACCOUNT_KEY_FILE}"
-        print_info "You can use this key file with your application by specifying it in the Streamlit sidebar."
-    else
-        print_warning "Failed to create service account key. This is expected in Qwiklabs environment."
-    fi
+# Create the new service account key
+if gcloud iam service-accounts keys create ${SERVICE_ACCOUNT_KEY_FILE} --project=${PROJECT_ID} --iam-account=${SERVICE_ACCOUNT_EMAIL}; then
+    print_success "Service account key created at: ${SERVICE_ACCOUNT_KEY_FILE}"
 else
-    print_warning "Not creating a key file for user account ${SERVICE_ACCOUNT_EMAIL}."
-    print_info "For Qwiklabs, you should already be authenticated with your student account."
-    
-    # Create a dummy credentials file with instructions
-    cat > "qwiklabs-credentials-info.txt" << EOL
-This file was created by the setup script to help you use Google Cloud in Qwiklabs.
-
-In Qwiklabs, you are already authenticated with your student account:
-${SERVICE_ACCOUNT_EMAIL}
-
-To use your application:
-1. Make sure you're logged into the Google Cloud Console with this account
-2. Your application should automatically use your Qwiklabs credentials
-3. If prompted for a credentials file, leave the field blank to use your current authentication
-
-Project ID: ${PROJECT_ID}
-GCS Bucket: ${GCS_BUCKET}
-BigQuery Dataset: ${BQ_DATASET}
-BigQuery Table: ${BQ_TABLE}
-EOL
-    print_info "Created a helper file with authentication information: qwiklabs-credentials-info.txt"
+    print_error "Failed to create service account key at ${SERVICE_ACCOUNT_KEY_FILE}. Please check permissions."
+    exit 1
 fi
 
-# Final Summary
-print_info "\n---------------------------------------------------"
-print_success " Google Cloud Setup Completed!"
-print_info "---------------------------------------------------"
-echo -e " Project ID:            ${GREEN}${PROJECT_ID}${NC}"
-echo -e " Project Name:          ${GREEN}${PROJECT_NAME}${NC}"
-echo -e " GCS Bucket for Chunks: ${GREEN}gs://${GCS_BUCKET}${NC}"
-echo -e " BigQuery Dataset:      ${GREEN}${BQ_DATASET}${NC}"
-echo -e " BigQuery Table:        ${GREEN}${BQ_TABLE}${NC}"
-echo -e " Text Search Index:     ${GREEN}${SEARCH_INDEX_NAME}${NC}"
-echo -e " Vector Search Index:   ${GREEN}${VECTOR_INDEX_NAME}${NC}"
-echo -e " Using Account:         ${GREEN}${SERVICE_ACCOUNT_EMAIL}${NC}"
-if [ -f "${SERVICE_ACCOUNT_KEY_FILE}" ]; then
-    echo -e " Service Account Key:   ${GREEN}${PWD}/${SERVICE_ACCOUNT_KEY_FILE}${NC}"
+# Grant permissions to the *newly created/ensured* service account
+print_info "Granting necessary permissions to: ${SERVICE_ACCOUNT_EMAIL}"
+
+# GCS permissions
+if gcloud storage buckets add-iam-policy-binding gs://${GCS_BUCKET} --project=${PROJECT_ID} \
+    --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
+    --role="roles/storage.admin" --condition=None >/dev/null 2>&1; then
+    print_success "GCS permissions granted."
+else
+    print_warning "Could not grant GCS permissions. May already exist or insufficient privileges."
 fi
-print_info "---------------------------------------------------
-"
-print_info "You are already authenticated with your Qwiklabs account."
-print_info "Your Qwiklabs student account should have the necessary BigQuery permissions by default."
-print_info "Update your application's settings (e.g., in Streamlit sidebar) with these resource names."
+
+# BigQuery permissions
+if gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+    --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
+    --role="roles/bigquery.dataEditor" --condition=None >/dev/null 2>&1; then
+    print_success "BigQuery dataEditor permissions granted."
+fi
+
+if gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+    --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
+    --role="roles/bigquery.jobUser" --condition=None >/dev/null 2>&1; then
+    print_success "BigQuery jobUser permissions granted."
+fi
+
+# Vertex AI permissions
+if gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+    --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
+    --role="roles/aiplatform.user" --condition=None >/dev/null 2>&1; then
+    print_success "Vertex AI permissions granted."
+fi
+
+
+# Set up download capability for the generated key file
+setup_credential_download
 
 # Create environment variables file
-print_info "Creating environment variables file (.env) for your application..."
+print_info "Creating environment variables file (.env)..."
 cat > ".env" << EOL
-# Google Cloud Settings
+# Google Cloud Settings (Auto-generated by setup script)
 BQ_PROJECT_ID=${PROJECT_ID}
 BQ_DATASET=${BQ_DATASET}
 BQ_TABLE=${BQ_TABLE}
 GCS_BUCKET_NAME=${GCS_BUCKET}
-GOOGLE_APPLICATION_CREDENTIALS=$([ -f "${SERVICE_ACCOUNT_KEY_FILE}" ] && echo "${PWD}/${SERVICE_ACCOUNT_KEY_FILE}" || echo "")
+GOOGLE_APPLICATION_CREDENTIALS=${SERVICE_ACCOUNT_KEY_FILE}
 
-# NOTE: You need to set your GEMINI_API_KEY for the LLM functionality
-# GEMINI_API_KEY=your-gemini-api-key
+# Authentication Info
+CURRENT_ACCOUNT=${SERVICE_ACCOUNT_EMAIL}
 
 # For semantic search using Vertex AI embeddings
 USE_VECTOR_SEARCH=true
-EMBEDDING_MODEL="textembedding-gecko@latest"
+EMBEDDING_MODEL=textembedding-gecko@latest
 EOL
 
-print_success "Environment file created: .env"
-print_info "To enable full semantic search with embeddings, please add your GEMINI_API_KEY to the .env file." 
+# Create setup summary file
+cat > "setup-summary.md" << EOL
+# Google Cloud Setup Summary
+
+## Project Information
+- **Project ID**: ${PROJECT_ID}
+- **Project Name**: ${PROJECT_NAME}
+- **Region**: ${REGION}
+
+## Resources Created
+- **GCS Bucket**: gs://${GCS_BUCKET}
+- **BigQuery Dataset**: ${BQ_DATASET}
+- **BigQuery Table**: ${BQ_TABLE}
+- **Text Search Index**: ${SEARCH_INDEX_NAME}
+- **Vector Search Index**: ${VECTOR_INDEX_NAME}
+
+## Authentication
+- **Account**: ${SERVICE_ACCOUNT_EMAIL}
+- **Key File**: ${SERVICE_ACCOUNT_KEY_FILENAME} (located at \`${SERVICE_ACCOUNT_KEY_FILE}\`)
+
+## Next Steps
+1. Add your API keys to the \`.env\` file
+2. Update your application configuration to use the \`credentials.json\` file.
+3. Test the setup with a small PDF file
+4. **Important for Vector Search:** The vector index will only be fully created and usable once you have loaded data (with embeddings) into the \`${BQ_DATASET}.${BQ_TABLE}\` BigQuery table.
+
+## Useful Commands
+\`\`\`bash
+# View your project
+gcloud config get project
+
+# List BigQuery datasets
+bq ls --project_id=${PROJECT_ID}
+
+# List GCS buckets
+gcloud storage ls
+
+# Check service account permissions
+gcloud projects get-iam-policy ${PROJECT_ID}
+\`\`\`
+EOL
+
+# Final Summary
+print_info "\n======================================================"
+print_success "🎉 GOOGLE CLOUD SETUP COMPLETED SUCCESSFULLY! 🎉"
+print_info "======================================================"
+echo -e " Project ID:             ${GREEN}${PROJECT_ID}${NC}"
+echo -e " GCS Bucket:             ${GREEN}gs://${GCS_BUCKET}${NC}"
+echo -e " BigQuery Dataset:       ${GREEN}${BQ_DATASET}${NC}"
+echo -e " BigQuery Table:         ${GREEN}${BQ_TABLE}${NC}"
+echo -e " Service Account:        ${GREEN}${SERVICE_ACCOUNT_EMAIL}${NC}"
+echo -e " Service Account Key:    ${GREEN}${SERVICE_ACCOUNT_KEY_FILE}${NC}"
+echo -e " Environment File:       ${GREEN}.env${NC}"
+echo -e " Setup Summary:          ${GREEN}setup-summary.md${NC}"
+print_info "======================================================"
+
+# Print variables in requested format
+echo ""
+print_info "📋 Key Environment Variables:"
+echo "PROJECT_ID=${PROJECT_ID}"
+echo "PROJECT_NAME=${PROJECT_NAME}"
+echo "GCS_BUCKET_NAME=${GCS_BUCKET}"
+echo "BQ_DATASET=${BQ_DATASET}"
+echo "BQ_TABLE=${BQ_TABLE}"
+echo "SERVICE_ACCOUNT=${SERVICE_ACCOUNT_EMAIL}"
+echo "SERVICE_ACCOUNT_KEY_FILE=${SERVICE_ACCOUNT_KEY_FILE}"
+echo ""
+
+print_info "✅ Your Google Cloud environment is ready!"
+print_info "✅ Configuration files have been created"
+print_info "✅ All required resources are set up"
+echo ""
+
+# Show credential download instructions
+print_info "🔑 CREDENTIAL DOWNLOAD OPTIONS:"
+echo ""
+echo -e "${GREEN}1. Quick Download (Recommended for Cloud Shell):${NC}"
+echo "    ./download_credentials.sh \"$SERVICE_ACCOUNT_KEY_FILE\""
+echo "    Then use Cloud Shell Web Preview on port 8080"
+echo ""
+echo -e "${GREEN}2. Command Line Download (if server is running):${NC}"
+echo "    # First start the server:"
+echo "    ./download_credentials.sh \"$SERVICE_ACCOUNT_KEY_FILE\" &"
+echo "    # Then in another terminal:"
+echo "    curl -O http://localhost:8080/credentials.json"
+echo ""
+echo -e "${GREEN}3. Manual Copy (to display content directly):${NC}"
+echo "    cat \"$SERVICE_ACCOUNT_KEY_FILE\""
+echo ""
+echo -e "${YELLOW}📱 Pro Tip:${NC} Use Cloud Shell's Web Preview feature!"
+echo "    1. Run: ./download_credentials.sh \"$SERVICE_ACCOUNT_KEY_FILE\""
+echo "    2. Click 'Web Preview' -> 'Preview on port 8080'"
+echo "    3. Click the download button in your browser"
+echo ""
+
+print_warning "📝 Don't forget to add your API keys to the .env file!"
+print_info "📖 Check setup-summary.md for detailed information"
+
+# Create quick start guide
+cat > "quick-start.md" << EOL
+# 🚀 Quick Start Guide
+
+## What was created:
+- ✅ Google Cloud Project: \`${PROJECT_ID}\`
+- ✅ GCS Bucket: \`gs://${GCS_BUCKET}\`
+- ✅ BigQuery Dataset: \`${BQ_DATASET}\`
+- ✅ BigQuery Table: \`${BQ_TABLE}\`
+- ✅ Service Account Key: \`${SERVICE_ACCOUNT_KEY_FILENAME}\` (located at \`${SERVICE_ACCOUNT_KEY_FILE}\`)
+
+## Next Steps:
+
+### 1. Download Credentials (if needed)
+\`\`\`bash
+# Start download server
+./download_credentials.sh "${SERVICE_ACCOUNT_KEY_FILE}"
+
+# Use Web Preview on port 8080, or:
+curl -O http://localhost:8080/credentials.json
+\`\`\`
+
+### 2. Add API Keys to .env
+Edit the \`.env\` file and add:
+\`\`\`
+GEMINI_API_KEY=your-api-key-here
+OPENAI_API_KEY=your-api-key-here  # if using OpenAI
+\`\`\`
+
+### 3. Test Your Setup
+\`\`\`bash
+# Check project
+gcloud config get project
+
+# List resources
+bq ls --project_id=${PROJECT_ID}
+gcloud storage ls
+
+# Test BigQuery with the generated key file
+# Make sure you have downloaded 'credentials.json' first!
+export GOOGLE_APPLICATION_CREDENTIALS="${SERVICE_ACCOUNT_KEY_FILE}"
+python3 -c "from google.cloud import bigquery; client = bigquery.Client(); print('BigQuery client initialized successfully with ADC or key file!')"
+\`\`\`
+
+### 4. Use in Your Application
+- Project ID: \`${PROJECT_ID}\`
+- Bucket: \`${GCS_BUCKET}\`
+- Dataset.Table: \`${BQ_DATASET}.${BQ_TABLE}\`
+- Credentials: \`credentials.json\` (the file you download)
+
+### Python Example for BigQuery Client
+\`\`\`python
+from google.cloud import bigquery
+import os
+
+# Set the environment variable to point to your downloaded key file
+# os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = './credentials.json'
+
+# Or, if you use the .env file, ensure it's loaded:
+# from dotenv import load_dotenv
+# load_dotenv()
+# client = bigquery.Client() # This will pick up GOOGLE_APPLICATION_CREDENTIALS
+
+# If you explicitly want to load from the file path directly:
+client = bigquery.Client.from_service_account_json('./credentials.json')
+
+# Now you can use the client
+# query = "SELECT 'Hello from BigQuery with key file!' as message"
+# job = client.query(query)
+# for row in job.result():
+#     print(row.message)
+\`\`\`
+
+## Troubleshooting
+
+### Can't download credentials?
+\`\`\`bash
+# Manual copy (will print the content to your terminal)
+cat "${SERVICE_ACCOUNT_KEY_FILE}"
+\`\`\`
+
+### Permission issues?
+\`\`\`bash
+# Check current account
+gcloud auth list
+
+# Check project permissions    
+gcloud projects get-iam-policy ${PROJECT_ID}
+\`\`\`
+
+### Vector Index Creation Failed?
+The vector index on the \`embedding\` column might fail to create if the table is empty. This is expected. The index will be successfully created once you load data with embeddings into the \`${BQ_DATASET}.${BQ_TABLE}\` table. Your application can still use keyword search in the meantime.
+EOL
+
+echo ""
+print_success "🎉 Setup complete! Check quick-start.md for next steps 🚀"

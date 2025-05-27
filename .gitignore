@@ -50,3 +50,6 @@ service-account.json
 
 # Logs
 *.log
+app.db
+credentials/key.json
+credentials/key.json
